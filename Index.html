@@ -296,8 +296,35 @@ ul.keys li { font-family: var(--mono); font-size: .8rem; }
 @media (max-width: 760px) { .decide { grid-template-columns: minmax(0, 1fr); } }
 
 </style>
+
+<!-- Firebase SDK -->
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
+
+<style>
+#roomOverlay{position:fixed;inset:0;background:rgba(10,20,40,0.92);display:flex;align-items:center;justify-content:center;z-index:9999;font-family:'Inter',sans-serif;}
+#roomBox{background:#1a2535;border:1px solid #2d4060;border-radius:12px;padding:40px 48px;width:360px;max-width:90vw;text-align:center;}
+#roomBox h2{color:#e8f0fe;font-size:1.3rem;margin:0 0 6px;}
+#roomBox p{color:#8aa0c0;font-size:0.85rem;margin:0 0 24px;line-height:1.5;}
+#roomCodeInput{width:100%;box-sizing:border-box;padding:12px 16px;font-size:1.1rem;border:1px solid #2d4060;border-radius:8px;background:#0f1923;color:#e8f0fe;text-align:center;letter-spacing:2px;text-transform:uppercase;outline:none;margin-bottom:12px;}
+#roomCodeInput:focus{border-color:#4a7fd4;}
+#joinRoomBtn{width:100%;padding:12px;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer;}
+#joinRoomBtn:hover{background:#1d4ed8;}
+#roomStatus{margin-top:10px;font-size:0.82rem;min-height:18px;color:#f87171;}
+</style>
 </head>
 <body>
+
+<!-- Room Code Overlay -->
+<div id="roomOverlay">
+  <div id="roomBox">
+    <h2>Ridgeline Finance Lab</h2>
+    <p>Enter your group room code to sync with your partner.<br>Both partners use the same code.</p>
+    <input id="roomCodeInput" maxlength="20" placeholder="e.g. GROUP-3" autocomplete="off" spellcheck="false" />
+    <button id="joinRoomBtn" onclick="joinRoom()">Join Room</button>
+    <div id="roomStatus"></div>
+  </div>
+</div>
 
 <div class="frame">
   <aside class="side" id="side">
@@ -1030,7 +1057,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     try { var raw = localStorage.getItem(KEY); if (raw) { var s = JSON.parse(raw); if (s && s.game && s.game.state) return s; } } catch (e) { }
     return blank();
   }
-  function save() { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { } }
+  function save() { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { } if(typeof pushToFirebase === "function") pushToFirebase(); }
   function logEvent(kind, detail) { state.log.push({ t: new Date().toISOString(), kind: kind, detail: detail }); save(); }
   function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
   function money(x, d) { var neg = x < 0; var v = Math.abs(x).toLocaleString('en-US', { minimumFractionDigits: d == null ? 0 : d, maximumFractionDigits: d == null ? 0 : d }); return (neg ? '−' : '') + '$' + v; }
@@ -1622,6 +1649,80 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
 })();
 
 
+</script>
+
+<script>
+// ── Firebase config (shared with FX simulator) ──
+var FB_CONFIG = {
+  apiKey: "AIzaSyCjgraSUtveFYRO50qDSuUVCmb42zDlxnU",
+  authDomain: "my-project-1577995916726.firebaseapp.com",
+  databaseURL: "https://my-project-1577995916726-default-rtdb.firebaseio.com",
+  projectId: "my-project-1577995916726",
+  storageBucket: "my-project-1577995916726.firebasestorage.app",
+  messagingSenderId: "503294518028",
+  appId: "1:503294518028:web:4e02ab026749c92c381f29"
+};
+
+var _fbApp = firebase.initializeApp(FB_CONFIG);
+var _fbDb  = firebase.database();
+var _roomCode = null;
+var _fbSyncing = false;
+
+function setRoomStatus(msg, type) {
+  var el = document.getElementById('roomStatus');
+  if (el) { el.textContent = msg; el.style.color = type === 'err' ? '#f87171' : '#4ade80'; }
+}
+
+function joinRoom() {
+  var raw = document.getElementById('roomCodeInput').value.trim().toUpperCase();
+  if (!raw) { setRoomStatus('Please enter a room code', 'err'); return; }
+  if (!/^[A-Z0-9-]+$/.test(raw)) { setRoomStatus('Letters, numbers and hyphens only', 'err'); return; }
+  _roomCode = raw;
+  try { localStorage.setItem('corpsim_room', raw); } catch(e) {}
+
+  var ref = _fbDb.ref('corpsim/' + raw + '/state');
+  ref.once('value').then(function(snap) {
+    var data = snap.val();
+    if (data && data.game && data.game.state) {
+      // Partner already has a session — load it
+      state = data;
+      if (typeof render === 'function') render();
+    } else {
+      // First in — push current state up
+      pushToFirebase();
+    }
+    // Listen for changes from partner
+    ref.on('value', function(s) {
+      if (_fbSyncing) return;
+      var d = s.val();
+      if (d && d.game && d.game.state) {
+        state = d;
+        if (typeof render === 'function') render();
+      }
+    });
+    document.getElementById('roomOverlay').style.display = 'none';
+    setRoomStatus('', '');
+  }).catch(function(e) {
+    setRoomStatus('Connection error — check your internet', 'err');
+  });
+}
+
+function pushToFirebase() {
+  if (!_fbDb || !_roomCode) return;
+  _fbSyncing = true;
+  _fbDb.ref('corpsim/' + _roomCode + '/state').set(state).then(function() {
+    _fbSyncing = false;
+  }).catch(function() { _fbSyncing = false; });
+}
+
+// Auto-rejoin saved room on reload
+(function() {
+  var saved = '';
+  try { saved = localStorage.getItem('corpsim_room') || ''; } catch(e) {}
+  if (saved) {
+    document.getElementById('roomCodeInput').value = saved;
+  }
+})();
 </script>
 </body>
 </html>
